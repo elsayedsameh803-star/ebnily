@@ -14,3 +14,4 @@ coverage/
 .env*
 
 tsc-out.txt
+.env
