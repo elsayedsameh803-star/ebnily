@@ -220,7 +220,7 @@ export const AdminDashboardModal = ({
   const [isAuthenticating, setIsAuthenticating] = useState(false);
 
   // Admin Data State
-  const [activeTab, setActiveTab] = useState<'overview' | 'users' | 'devices' | 'transactions' | 'settings'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'users' | 'devices' | 'transactions' | 'settings' | 'admins'>('overview');
   const [isLoadingData, setIsLoadingData] = useState(false);
   const [isDataReady, setIsDataReady] = useState(false);
   const [dataError, setDataError] = useState<string | null>(null);
@@ -256,6 +256,12 @@ export const AdminDashboardModal = ({
   const [transactions, setTransactions] = useState<OrangeCashTransaction[]>([]);
   const [isCheckingSession, setIsCheckingSession] = useState(false);
   const [sessionError, setSessionError] = useState<string | null>(null);
+
+  // Admin email management
+  interface AdminRow { id: string; email: string; added_by: string; added_at: string }
+  const [adminList, setAdminList] = useState<AdminRow[]>([]);
+  const [adminEmailInput, setAdminEmailInput] = useState('');
+  const [isAddingAdmin, setIsAddingAdmin] = useState(false);
 
   // Filtering & Search
   const [searchQuery, setSearchQuery] = useState('');
@@ -328,6 +334,16 @@ export const AdminDashboardModal = ({
         setSettings((prev) => normalizeAdminSettings(data.settings, prev));
         setDevices(normalizeDevices(data.devices));
         setTransactions(normalizeTransactions(data.recentTransactions));
+        // Admin email list from the overview response.
+        const rawAdmins = (data as { admins?: unknown }).admins;
+        if (Array.isArray(rawAdmins)) {
+          setAdminList(rawAdmins.filter((r): r is AdminRow => isRecord(r) && typeof r.email === 'string').map((r) => ({
+            id: toText(r.id),
+            email: toText(r.email),
+            added_by: toText(r.added_by),
+            added_at: toText(r.added_at),
+          })));
+        }
         // Accounts + presence. `accounts` is absent on a deployment that has not
         // run the accounts half of the SQL yet, so this normalizes to [] rather
         // than throwing — the Users tab then says "run the SQL" instead of the
@@ -527,6 +543,65 @@ export const AdminDashboardModal = ({
     },
     [mutateAccount],
   );
+
+  const handleAddAdmin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const email = adminEmailInput.trim().toLowerCase();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      setActionErrorMessage('البريد الإلكتروني غير صحيح.');
+      setActionSuccessMessage(null);
+      return;
+    }
+    setIsAddingAdmin(true);
+    try {
+      const res = await fetch('/api/admin/admins', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ email }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setActionErrorMessage((data as { message?: string }).message || 'تعذّر إضافة الأدمن.');
+        setActionSuccessMessage(null);
+        return;
+      }
+      setAdminEmailInput('');
+      setActionSuccessMessage(`تمت إضافة ${email} كأدمن بنجاح. سيدخل لوحة التحكم بمجرد تسجيل الدخول بحسابه بدون كلمة مرور.`);
+      setActionErrorMessage(null);
+      // Refresh the admin list from the overview.
+      void fetchAdminData();
+    } catch {
+      setActionErrorMessage('تعذّر الاتصال بالخادم.');
+      setActionSuccessMessage(null);
+    } finally {
+      setIsAddingAdmin(false);
+    }
+  };
+
+  const handleRemoveAdmin = async (email: string) => {
+    if (!window.confirm(`حذف ${email} من قائمة الأدمن؟`)) return;
+    try {
+      const res = await fetch('/api/admin/admins', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ email }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setActionErrorMessage((data as { message?: string }).message || 'تعذّر حذف الأدمن.');
+        setActionSuccessMessage(null);
+        return;
+      }
+      setAdminList((prev) => prev.filter((a) => a.email !== email));
+      setActionSuccessMessage(`تم حذف ${email} من قائمة الأدمن.`);
+      setActionErrorMessage(null);
+    } catch {
+      setActionErrorMessage('تعذّر الاتصال بالخادم.');
+      setActionSuccessMessage(null);
+    }
+  };
 
   const handleLogin = async (e: import('react').FormEvent) => {
     e.preventDefault();

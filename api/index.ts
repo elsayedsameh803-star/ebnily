@@ -216,6 +216,43 @@ function isOwnerAccount(session: AuthUser | null): boolean {
   return normalizeEmail(session.email) === OWNER_EMAIL;
 }
 
+/**
+ * Added-admin email cache.
+ *
+ * The owner can add admin emails from the dashboard. An account matching a row
+ * in `ebnily_admins` gets full admin access WITHOUT the PIN — they just sign in
+ * with Google/GitHub. The original owner still needs the PIN as a second factor.
+ *
+ * The cache refreshes every 60 seconds so a newly added admin gets access
+ * within a minute, and a removed admin is locked out equally fast.
+ */
+let adminEmailCache: Set<string> = new Set();
+let adminCacheAt = 0;
+const ADMIN_CACHE_TTL_MS = 60_000;
+
+async function refreshAdminEmails(): Promise<Set<string>> {
+  if (Date.now() - adminCacheAt < ADMIN_CACHE_TTL_MS) return adminEmailCache;
+  if (!supabaseConfig().dbConfigured) return adminEmailCache;
+  adminCacheAt = Date.now();
+  try {
+    const res = await dbRequest<Array<{ email: string }>>(ADMINS_TABLE, {
+      query: { select: "email", limit: "500" },
+    });
+    if (res.ok && Array.isArray(res.data)) {
+      adminEmailCache = new Set(res.data.map((r) => normalizeEmail(r.email)).filter(Boolean));
+    }
+  } catch {
+    // keep the old cache
+  }
+  return adminEmailCache;
+}
+
+/** Synchronous check using the cached list. */
+function isAddedAdmin(session: AuthUser | null): boolean {
+  if (!session?.email) return false;
+  return adminEmailCache.has(normalizeEmail(session.email));
+}
+
 // ── Staff accounts: automatic Business tier ───────────────────────────────────
 // The list, the matcher and the reasoning all live in `api/security.ts`:
 //   • `isStaffEmail()` decides the SUBSCRIPTION tier only.
@@ -1665,12 +1702,17 @@ function pinMatches(pin: unknown): boolean {
 // the outside rather than advertise itself with a "forbidden" answer.
 function requireAdmin(req: Request, res: Response, next: NextFunction) {
   const session = readAuthSession(req as AuthReq);
-  if (!isOwnerAccount(session) || !isValidAdminSession(readAdminCookie(req))) {
-    return res
-      .status(404)
-      .json({ success: false, message: "Not found" });
+  // The original owner needs the PIN cookie (two-factor). An added admin
+  // bypasses the PIN — their email was explicitly trusted by the owner.
+  if (isOwnerAccount(session) && isValidAdminSession(readAdminCookie(req))) {
+    return next();
   }
-  next();
+  if (isAddedAdmin(session)) {
+    return next();
+  }
+  return res
+    .status(404)
+    .json({ success: false, message: "Not found" });
 }
 
 app.post("/api/admin/auth", rateLimit(authLimiter, LIMIT_RULES.auth, "admin", "محاولات كثيرة جداً. انتظر قليلاً ثم أعد المحاولة."), (req: Request, res: Response) => {
@@ -1743,7 +1785,7 @@ app.get("/api/admin/overview", requireAdmin, async (_req: Request, res: Response
   const accountSelect =
     "account_id,email,display_name,provider,avatar_url,credits,credits_granted,welcome_given,last_seen_at,first_seen_at,requests_count,last_ip,user_agent,tier,is_blocked,block_reason";
 
-  const [paymentsRes, pendingRes, devicesRes, confirmedRes, settingsRes, accountsRes] =
+  const [paymentsRes, pendingRes, devicesRes, confirmedRes, settingsRes, accountsRes, adminsRes] =
     await Promise.all([
       dbRequest<DbPayment[]>(PAYMENTS_TABLE, {
         query: { select: paymentSelect, order: "submitted_at.desc", limit: "50" },
@@ -1765,6 +1807,9 @@ app.get("/api/admin/overview", requireAdmin, async (_req: Request, res: Response
       // this ordering makes "من سجّل حديثاً" the default view.
       dbRequest<DbAccount[]>(ACCOUNTS_TABLE, {
         query: { select: accountSelect, order: "first_seen_at.desc", limit: "200" },
+      }),
+      dbRequest<Array<{ id: string; email: string; added_by: string; added_at: string }>>(ADMINS_TABLE, {
+        query: { select: "id,email,added_by,added_at", order: "added_at.desc", limit: "200" },
       }),
     ]);
 
@@ -1833,6 +1878,7 @@ app.get("/api/admin/overview", requireAdmin, async (_req: Request, res: Response
     accounts: publicAccounts,
     devices: devices.map(toPublicDevice),
     recentTransactions: paymentsRes.ok && Array.isArray(paymentsRes.data) ? paymentsRes.data.map(toPublicPayment) : [],
+    admins: adminsRes.ok && Array.isArray(adminsRes.data) ? adminsRes.data : [],
   });
 });
 
@@ -1923,6 +1969,78 @@ app.post("/api/admin/settings", requireAdmin, async (req: Request, res: Response
     return res.status(503).json({ success: false, message: "تعذّر حفظ الإعدادات. تأكد من تنفيذ supabase/projects.sql." });
   }
   res.json({ success: true, persisted: true, settings: next });
+});
+
+// ── Admin management: add/remove admin emails ────────────────────────────────
+// The owner can add email addresses that get full admin access without the PIN.
+// Only the original owner (SITE_OWNER_EMAIL + PIN) can manage this list.
+
+app.get("/api/admin/admins", requireAdmin, async (_req: Request, res: Response) => {
+  if (!supabaseConfig().dbConfigured) return dbUnavailable(res);
+  const result = await dbRequest<Array<{ id: string; email: string; added_by: string; added_at: string }>>(ADMINS_TABLE, {
+    query: { select: "id,email,added_by,added_at", order: "added_at.desc", limit: "200" },
+  });
+  if (!result.ok) {
+    return res.status(503).json({ success: false, message: "تعذّر تحميل قائمة الأدمن." });
+  }
+  const rows = Array.isArray(result.data) ? result.data : [];
+  res.json({ success: true, admins: rows });
+});
+
+app.post("/api/admin/admins", requireAdmin, async (req: Request, res: Response) => {
+  // Only the original owner can add/remove admins — not added admins themselves.
+  if (!isOwnerAccount(readAuthSession(req as AuthReq))) {
+    return res.status(403).json({ success: false, message: "هذه العملية متاحة لصاحب الموقع الأصلي فقط." });
+  }
+  if (!supabaseConfig().dbConfigured) return dbUnavailable(res);
+  const body = (req.body as { email?: string }) ?? {};
+  const email = String(body.email ?? "").trim().toLowerCase();
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ success: false, message: "البريد الإلكتروني غير صحيح." });
+  }
+  if (email === OWNER_EMAIL) {
+    return res.status(400).json({ success: false, message: "هذا البريد هو المالك الأصلي بالفعل." });
+  }
+
+  const id = `adm_${Date.now().toString(36)}_${crypto.randomBytes(4).toString("hex")}`;
+  const write = await dbRequest(ADMINS_TABLE, {
+    method: "POST",
+    query: { on_conflict: "ignore" },
+    body: JSON.stringify({ id, email, added_by: OWNER_EMAIL || "owner" }),
+  });
+  if (!write.ok) {
+    // 409 from PostgREST means the email already exists — not a real error.
+    if (write.status === 409) {
+      return res.status(409).json({ success: false, message: "هذا البريد مضاف بالفعل." });
+    }
+    return res.status(503).json({ success: false, message: "تعذّر إضافة الأدمن." });
+  }
+  // Refresh the cache immediately so the new admin is recognized.
+  adminCacheAt = 0;
+  void refreshAdminEmails();
+  res.json({ success: true, email });
+});
+
+app.delete("/api/admin/admins", requireAdmin, async (req: Request, res: Response) => {
+  // Only the original owner can remove admins.
+  if (!isOwnerAccount(readAuthSession(req as AuthReq))) {
+    return res.status(403).json({ success: false, message: "هذه العملية متاحة لصاحب الموقع الأصلي فقط." });
+  }
+  if (!supabaseConfig().dbConfigured) return dbUnavailable(res);
+  const email = String((req.body as { email?: string })?.email ?? "").trim().toLowerCase();
+  if (!email) {
+    return res.status(400).json({ success: false, message: "البريد الإلكتروني مطلوب." });
+  }
+  const write = await dbRequest(ADMINS_TABLE, {
+    method: "DELETE",
+    query: { email: `eq.${email}` },
+  });
+  if (!write.ok) {
+    return res.status(503).json({ success: false, message: "تعذّر حذف الأدمن." });
+  }
+  adminCacheAt = 0;
+  void refreshAdminEmails();
+  res.json({ success: true, email });
 });
 
 app.post("/api/admin/device/toggle-block", requireAdmin, async (req: Request, res: Response) => {
@@ -2518,6 +2636,7 @@ const PAYMENTS_TABLE = "ebnily_payments";
 const DEVICES_TABLE = "ebnily_devices";
 const SETTINGS_TABLE = "ebnily_settings";
 const ACCOUNTS_TABLE = "ebnily_accounts";
+const ADMINS_TABLE = "ebnily_admins";
 
 /**
  * Credits granted to a brand-new account.
@@ -3179,6 +3298,9 @@ app.get("/api/auth/providers", (req: AuthReq, res: AuthRes) => {
 app.get("/api/auth/me", async (req: AuthReq, res: AuthRes) => {
   const user = readAuthSession(req);
 
+  // Refresh the admin email cache so a newly added admin is recognized promptly.
+  await refreshAdminEmails();
+
   // Presence + sign-up record. This is the one endpoint the client hits on every
   // load and the owner dashboard hits on every poll, which is what makes
   // `last_seen_at` a real heartbeat rather than a one-off sign-up stamp. It also
@@ -3190,11 +3312,14 @@ app.get("/api/auth/me", async (req: AuthReq, res: AuthRes) => {
   // rather than as zero — a missing allowance must never read as "you have none".
   const account = user ? await touchAccount(req, user) : null;
 
+  // An added admin gets isOwner=true so the dashboard and sidebar controls appear.
+  const ownerFlag = isOwnerAccount(user) || isAddedAdmin(user);
+
   res.json({
     success: true,
     authenticated: Boolean(user),
-    user: user ? { ...user, isOwner: isOwnerAccount(user) } : null,
-    isOwner: isOwnerAccount(user),
+    user: user ? { ...user, isOwner: ownerFlag } : null,
+    isOwner: ownerFlag,
     ...(account
       ? {
           credits: toNumber(account.credits),
